@@ -1,0 +1,66 @@
+#read file into fastq_1
+fastq_1 <- readLines("/home/elvira/SRR3474721_1.fastq")
+
+#read the lines into individual lists
+IDs <-  fastq[seq(1, length(fastq), 4)]
+sequences <- fastq[seq(2, length(fastq), 4)]
+quality_raw <-  fastq[seq(4, length(fastq), 4)]
+
+#convert the quality scores into numbers
+quality_scores <- lapply(quality_raw, function(q) utf8ToInt(q) - 33)
+
+#trimming the end, where low quality bases are
+quality_trimming <- function(seq, qual, threshold = 20 ) {
+  #keep is the highest position where the quality is still over 20
+  #we cut off after the index of keep
+  keep <-  max(which(qual >= threshold))
+  if(length(keep) == 0) return(NA)
+  list(
+    #creates new lists for seq and qual, where only positions 1 to keep are included
+    seq = substr(seq, 1, keep),
+    qual = qual[1:keep]
+  )
+}
+
+#applies trimming to all lists
+trimmed <-  Map(quality_trimming, sequences, quality_scores, threshold = 20)
+
+#defining an adapter sequence
+adapter <-"AGATCGGAAGAGC"
+
+#trimming the adapter sequence if needed
+adapter_trimming <-  function(seq, qual, adapter) {
+  #finding the spot of the adapter
+  pos <- regexpr(adapter, seq)
+  #creating the trimmed lists
+  if(pos[1] > 0) {
+    seq <-  substr(seq, 1, pos[1] - 1)
+    qual <- qual[1:(pos[1] - 1)]
+  }
+  list(seq = seq, qual = qual)
+}
+
+#applying the function to all lists
+trimmed2 <- lapply(trimmed, function(x) {
+  if(is.na(x[[1]])) return(NA)
+  adapter_trimming(x$seq, x$qual, adapter)
+})
+
+#minimum read length for the reads
+min_len <-  30
+#going through each element x in trimmed2, if it exists and(&&) at least 30 bases
+keep_idx <-  sapply(trimmed2, function(x) !is.na(x[[1]]) && nchar(x$seq) >= min_len)
+
+#creating the new lists, without the short sequences
+seqs_filt <-  sapply(trimmed2[keep_idx], `[[`, "seq")
+quals_filt <-  sapply(trimmed2[keep_idx], `[[`, "qual")
+
+#keeping only the IDs to the bases, which are not trimmed
+ids_filt <- ids[keep_idx]
+
+#creating the new fastQ file
+writeLines(
+  c(rbind(ids_filt, seqs_filt, "+",
+          sapply(quals_filt, function(q) intToUtf8(q + 33)))),
+  "sample_trimmed.fastq"
+  )
