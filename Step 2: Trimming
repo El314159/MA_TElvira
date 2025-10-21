@@ -1,26 +1,38 @@
-#read file into fastq_1
-fastq_1 <- readLines("/home/elvira/SRR3474721_1.fastq")
+#read fastq file
+fastq <- readLines("/home/elvira/SRR3474868.fastq")
 
 #read the lines into individual lists
-IDs <-  fastq[seq(1, length(fastq), 4)]
+ids <-  fastq[seq(1, length(fastq), 4)]
 sequences <- fastq[seq(2, length(fastq), 4)]
-quality_raw <-  fastq[seq(4, length(fastq), 4)]
+quality_raw <-fastq[seq(4, length(fastq), 4)]
 
 #convert the quality scores into numbers
 quality_scores <- lapply(quality_raw, function(q) utf8ToInt(q) - 33)
 
-#trimming the end, where low quality bases are
-quality_trimming <- function(seq, qual, threshold = 20 ) {
-  #keep is the highest position where the quality is still over 20
-  #we cut off after the index of keep
-  keep <-  max(which(qual >= threshold))
-  if(length(keep) == 0) return(NA)
+#trimming the end of the read, where low quality bases are
+quality_trimming <- function(seq, qual, threshold = 20) {
+  
+  # Remove NA quality scores
+  qual[is.na(qual)] <- -Inf
+  
+  # positions where the quality is lower than 20
+  keep_positions <- which(qual >= threshold)
+  
+  #if none of the bases are good quality whole read is deleted
+  if (length(keep_positions) == 0) {
+    return(list(seq = NA, qual = NA))
+  }
+  
+  #taking the latest/highest position with still good quality
+  keep <- max(keep_positions)
+  
+  # cuts off the bad ends from the position keep on
   list(
-    #creates new lists for seq and qual, where only positions 1 to keep are included
     seq = substr(seq, 1, keep),
     qual = qual[1:keep]
   )
 }
+
 
 #applies trimming to all lists
 trimmed <-  Map(quality_trimming, sequences, quality_scores, threshold = 20)
@@ -42,25 +54,33 @@ adapter_trimming <-  function(seq, qual, adapter) {
 
 #applying the function to all lists
 trimmed2 <- lapply(trimmed, function(x) {
-  if(is.na(x[[1]])) return(NA)
+  # skip missing or bad reads
+  if (is.null(x) || is.na(x$seq)) return(NULL)
   adapter_trimming(x$seq, x$qual, adapter)
 })
 
 #minimum read length for the reads
 min_len <-  30
 #going through each element x in trimmed2, if it exists and(&&) at least 30 bases
-keep_idx <-  sapply(trimmed2, function(x) !is.na(x[[1]]) && nchar(x$seq) >= min_len)
+keep_idx <-  sapply(trimmed2, function(x) {
+  if(is.null(x) || is.na(x$seq)) return(FALSE)
+  nchar(x$seq) >= min_len
+})
 
-#creating the new lists, without the short sequences
-seqs_filt <-  sapply(trimmed2[keep_idx], `[[`, "seq")
-quals_filt <-  sapply(trimmed2[keep_idx], `[[`, "qual")
-
+#filter the trimmed reads
+trimmed2 <- trimmed2[keep_idx]
+  
 #keeping only the IDs to the bases, which are not trimmed
 ids_filt <- ids[keep_idx]
 
+#creating the new lists, without the short sequences
+seqs_filt <-  vapply(trimmed2, function(x) x$seq, character(1))
+quals_filt <-  sapply(trimmed2, function(x) x$qual)
+
+qual_ascii <- sapply(quals_filt, function(q) intToUtf8(q + 33))
+
 #creating the new fastQ file
 writeLines(
-  c(rbind(ids_filt, seqs_filt, "+",
-          sapply(quals_filt, function(q) intToUtf8(q + 33)))),
+  c(rbind(ids_filt, seqs_filt, "+", qual_ascii)),
   "sample_trimmed.fastq"
   )
