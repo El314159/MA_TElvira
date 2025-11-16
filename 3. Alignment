@@ -1,0 +1,91 @@
+library(data.table)
+
+fasta_file <- "/home/elvira/Alignment/Homo_sapiens.GRCh38.cdna.all.fa"
+k <- 25
+
+#read fastq file
+#only sequences and headers
+fastq <- readLines("/home/elvira/Cancer_data/SRR3474868/Trimmed_SRR3474868.fastq")
+reads <- fastq[seq(2, length(fastq), 4)]
+names(reads) <- sub("^@", "", fastq[seq(1, length(fastq), 4)])
+
+#take just the first 50 reads for a faster test
+subset_reads <- reads[1:50]
+
+#read the reference transcriptome
+fasta <- readLines(fasta_file)
+is_header <- grepl("^>", fasta)
+tx_names <- sub("^>", "", fasta[is_header])
+tx_seqs_list <- split(fasta[!is_header], cumsum(is_header)[!is_header])
+ref_transcripts_full <- sapply(tx_seqs_list, paste, collapse = "")
+names(ref_transcripts_full) <- tx_names
+
+#just the first 1000 transcripts for a faster test
+transcripts <- 1000 
+ref_transcripts <- ref_transcripts_full[1:transcripts]
+
+#extract the k-mers
+get_kmers <- function(seq, k){
+  n <- nchar(seq)
+  if(n < k) return(character(0))
+  substring(seq, 1:(n - k + 1), k:(n))
+}
+
+#create k-mers of the transcript
+ref_kmers <- lapply(ref_transcripts, get_kmers, k = k)
+
+#create the data table (index)
+kmer_dt <- data.table(
+  kmer = unlist(ref_kmers, use.names = FALSE),
+  transcript = rep(names(ref_kmers), times = sapply(ref_kmers, length))
+)
+
+#free the RAM
+rm(ref_kmers)
+gc()
+
+#create an index, removes duplicates, groups k-mers, creates lists
+kmer_index_dt <- unique(kmer_dt)[, .(tx_list = list(transcript)), by = kmer]
+
+#create the final list
+kmer_index <- kmer_index_dt$tx_list
+names(kmer_index) <- kmer_index_dt$kmer
+
+#free the RAM
+rm(kmer_dt, kmer_index_dt)
+gc()
+
+#pseudoalignment
+alignment_results <- lapply(subset_reads, function(read_seq) {
+  
+  read_kmers <- get_kmers(read_seq, k)
+  
+  #finds the compatible transcripts
+  compat_list <- lapply(read_kmers, function(kmer) kmer_index[[kmer]])
+  
+  #remove empty results
+  compat_list <- compat_list[!sapply(compat_list, is.null)]
+  
+  if(length(compat_list) == 0) return(NA)
+  
+  #find the intersect
+  compatible <- Reduce(intersect, compat_list)
+  
+  if(length(compatible) == 0) return(NA)
+  return(compatible)
+})
+
+names(alignment_results) <- names(subset_reads)
+
+#build the results
+transcript_counts <- sort(table(unlist(alignment_results)), decreasing = TRUE)
+
+print(head(transcript_counts))
+
+output_file <- "SRR3474868_aligned_subset.txt"
+writeLines(paste(
+  names(alignment_results), ":",
+  sapply(alignment_results, function(x)
+    if(all(is.na(x))) "No match" else paste(x, collapse = ","))
+), con = output_file)
+
