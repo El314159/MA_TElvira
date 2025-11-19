@@ -1,0 +1,88 @@
+#load matrix
+matrix_path <- "/home/elvira/gene_level_count_matrix.tsv"
+
+raw_counts_df <- read.table(
+  matrix_path,
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  stringsAsFactors = FALSE
+)
+
+counts_matrix <- as.matrix(raw_counts_df)
+
+#TMM values
+trim.M <- 0.30  #30% of the extremes log_fold_changes
+trim.A <- 0.05  #5% of the genes with the lowest counts
+
+#samples
+samples_total <- ncol(counts_matrix)
+
+#reference indices: 6 to 10
+samples_normal_index <- 6:10 
+
+#initialized library sizes
+lib.sizes <- colSums(counts_matrix)
+
+#reference sample
+ref_lib_size <-  mean(lib.sizes[samples_normal_index])
+
+ref_counts <- rowMeans(counts_matrix[, samples_normal_index])
+
+ref_cpm <- ref_counts / ref_lib_size
+
+#calculating TMM values
+tmm_factors <- numeric(samples_total) 
+names(tmm_factors) <- colnames(counts_matrix)
+
+
+#calculating the tmm values
+for (i in 1:samples_total) {
+  if (i != ref_sample_index) {
+    
+    k_index <- i 
+    
+    #normalize to initial library size
+    k_cpm <- counts_matrix[, k_index] / lib.sizes[k_index]
+    
+    #remove genes with zero in both samples
+    non_zero_indices <- (counts_matrix[, k_index] > 0 | ref_counts > 0)
+    k_cpm_subset <- k_cpm[non_zero_indices]
+    ref_cpm_subset <- ref_cpm[non_zero_indices]
+    
+    #log-fold change and log-count
+    M <- log2(k_cpm_subset / ref_cpm_subset)
+    A <- 0.5 * log2(k_cpm_subset * ref_cpm_subset)
+    
+    #trimming of M and A
+    low_A_limit <- quantile(A, trim.A)
+    A_trimmed_indices <- (A >= low_A_limit) 
+    M_A_trimmed <- M[A_trimmed_indices]
+    
+    low_M_limit <- quantile(M_A_trimmed, trim.M)
+    high_M_limit <- quantile(M_A_trimmed, 1 - trim.M)
+    
+    M_final_trimmed <- M_A_trimmed[M_A_trimmed >= low_M_limit & M_A_trimmed <= high_M_limit]
+    
+    #calculating TMM value
+    log2_tmm_k <- mean(M_final_trimmed)
+    tmm_factors[i] <- 1 / (2^log2_tmm_k) 
+  }
+}
+
+
+#tmm normalized library size
+eff_lib_sizes <- lib.sizes * tmm_factors
+
+#normalized cpm (counts per million)
+normalized_counts_tmm_cpm <- t(t(counts_matrix) / eff_lib_sizes) * 1e6
+
+#save normalized matrix
+write.table(
+  normalized_counts_tmm_cpm, 
+  file = "normalized_gene_level_matrix.tsv", 
+  sep = "\t", 
+  quote = FALSE, 
+  col.names = NA
+)
+
