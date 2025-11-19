@@ -1,0 +1,120 @@
+#file paths
+aligned_path <- "/home/elvira/kallisto_quant_results"
+
+annotation_path <- "/home/elvira/gene_annotation_file/tx_to_gene.txt" 
+
+#load annotation file
+load_annotation_file <- function(file_path) {
+  
+  lines <- readLines(file_path)
+  
+  lines_cleaned <- sub(";\\s*$", "", lines)
+  
+  
+  mapping <- read.table(
+    text = lines_cleaned,
+    header = FALSE, 
+    sep = ";", 
+    quote = "\"",
+    stringsAsFactors = FALSE,
+    col.names = c("target_id", "gene_id"),
+    fill = TRUE,
+    strip.white = TRUE
+  )
+  
+  mapping$target_id <-  trimws(mapping$target_id)
+  mapping$gene_id <- trimws(mapping$gene_id)
+  
+  return(mapping)
+}
+
+#aggregation of the counts
+aggregate_counts <- function(abundance_file, mapping_df) {
+  counts_tx <- read.table(
+    abundance_file, 
+    header = TRUE, 
+    sep = "\t", 
+    stringsAsFactors = FALSE
+  )
+  
+  counts_tx <- counts_tx[, c("target_id", "est_counts")]
+  
+  counts_tx$target_id_merged <- sub("\\..*$", "", counts_tx$target_id)
+
+  merged_counts <- merge(
+    counts_tx, 
+    mapping_df, 
+    by.x = "target_id_merged",
+    by.y = "target_id",
+    all.x = TRUE 
+  )
+
+  gene_counts_vector <- tapply(
+    merged_counts$est_counts, 
+    merged_counts$gene_id, 
+    sum
+  )
+  
+  gene_counts_df <- data.frame(
+    gene_id = names(gene_counts_vector),
+    counts = gene_counts_vector,
+    stringsAsFactors = FALSE
+  )
+  
+  sample_name <- basename(dirname(abundance_file))
+  
+  colnames(gene_counts_df)[colnames(gene_counts_df) == "counts"] <- sample_name
+  
+  return(gene_counts_df)
+}
+
+#load the annotation
+mapping_df <- load_annotation_file(annotation_path)
+
+#searches all abundance files
+abundance_files <- list.files(
+  aligned_path, 
+  pattern = "abundance.tsv", 
+  full.names = TRUE, 
+  recursive = TRUE
+)
+
+#works through the first sample, starting point for the matrix
+final_matrix <- aggregate_counts(abundance_files[1], mapping_df)
+
+#works through all the other samples
+if (length(abundance_files) > 1) {
+  for (i in 2:length(abundance_files)) {
+    
+    current_counts <- aggregate_counts(abundance_files[i], mapping_df)
+    
+    final_matrix <- as.data.frame(final_matrix)
+    
+    final_matrix <- merge(
+      final_matrix, 
+      current_counts, 
+      by = "gene_id", 
+      all = TRUE
+    )
+  }
+}
+
+#moves gene IDs from columns into the name of the rows
+row.names(final_matrix) <- final_matrix$gene_id
+
+#removes the redundant column
+final_matrix$gene_id <- NULL
+
+#removes NA, by 0
+final_matrix[is.na(final_matrix)] <- 0
+
+#converts into a numeric matrix
+final_matrix <- as.matrix(final_matrix)
+
+write.table(
+  final_matrix, 
+  file = "gene_level_count_matrix.tsv", 
+  sep = "\t", 
+  quote = FALSE, 
+  col.names = NA
+)
