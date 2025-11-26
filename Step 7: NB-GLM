@@ -1,0 +1,291 @@
+library(gplots)
+library(RColorBrewer)
+
+#load matrix
+matrix_path <- "/home/elvira/gene_level_count_matrix.tsv"
+
+#read raw gene count data
+raw_counts_df <- read.table(
+  matrix_path,
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  stringsAsFactors = FALSE
+)
+
+#convert the dataframe into a matrix
+counts_matrix <- as.matrix(raw_counts_df)
+
+#TMM values
+trim.M <- 0.30  #30% of the extremes log_fold_changes
+trim.A <- 0.05  #5% of the genes with the lowest counts
+
+#samples
+samples_total <- ncol(counts_matrix)
+
+#reference indices: 6 to 10
+samples_normal_index <- 6:10 
+
+#initialized library sizes
+lib.sizes <- colSums(counts_matrix)
+
+#reference sample
+ref_lib_size <-  mean(lib.sizes[samples_normal_index])
+ref_counts <- rowMeans(counts_matrix[, samples_normal_index])
+ref_cpm <- ref_counts / ref_lib_size
+
+#calculating TMM values
+#initializing a vector to store the calculated factors
+tmm_factors <- numeric(samples_total) 
+names(tmm_factors) <- colnames(counts_matrix)
+
+
+#calculating the tmm values
+for (i in 1:samples_total) {
+    
+  #normalize to initial library size
+  k_cpm <- counts_matrix[, i] / lib.sizes[i]
+
+  #remove genes with zero in both samples
+  non_zero_indices <- (counts_matrix[, i] > 0 | ref_counts > 0)
+  k_cpm_subset <- k_cpm[non_zero_indices]
+  ref_cpm_subset <- ref_cpm[non_zero_indices]
+    
+  #log-fold change and log-count
+  M <- log2(k_cpm_subset / ref_cpm_subset)
+  A <- 0.5 * log2(k_cpm_subset * ref_cpm_subset)
+    
+  #trimming of M and A
+  low_A_limit <- quantile(A, trim.A)
+  A_trimmed_indices <- (A >= low_A_limit) 
+  M_A_trimmed <- M[A_trimmed_indices]
+  
+  #trim extreme LogFC values
+  low_M_limit <- quantile(M_A_trimmed, trim.M)
+  high_M_limit <- quantile(M_A_trimmed, 1 - trim.M)
+    
+  M_final_trimmed <- M_A_trimmed[M_A_trimmed >= low_M_limit & M_A_trimmed <= high_M_limit]
+    
+  #calculating TMM value
+  log2_tmm_k <- mean(M_final_trimmed)
+  tmm_factors[i] <- 1 / (2^log2_tmm_k) 
+}
+
+#set TMM factors for reference samples to 1
+tmm_factors[samples_normal_index] <- 1
+
+#define sample indices for DGE
+cancer_cols_dge <- 1:5
+normal_cols_dge <- 6:10
+sample_cols_dge <- c(cancer_cols_dge, normal_cols_dge)
+
+#subset raw counts and TMM factors to include only the samples for the DGE
+raw_counts <- counts_matrix[, sample_cols_dge]
+tmm_factors_dge <- tmm_factors[sample_cols_dge]
+
+#define grouping factor for GLM
+group_labels <- factor(c(rep("Krebs", 5), rep("Normal", 5)))
+
+#create matrix X for GLM
+X <- model.matrix(~ group_labels, data = data.frame(group_labels))
+
+#define offset term to include library size normalization
+offset_term <- log(tmm_factors_dge)
+
+#variance stabilization
+log_raw_counts <- log2(raw_counts + 1)
+
+#define thresholds (statistical and biological)
+p_value_threshold <- 0.05
+log2FC_threshold <- 1.0
+
+min_samples_expressed <-  3
+min_count <- 10
+
+#filtering genes
+expressed_criteria <- rowSums(raw_counts >= min_count) >= min_samples_expressed
+filtered_raw_counts <- raw_counts[expressed_criteria, ]
+filtered_log_raw_counts <- log_raw_counts[expressed_criteria, ]
+
+#number of genes after filtering
+num_genes_filtered <- nrow(filtered_raw_counts)
+
+#initialize results data frame for LogFC and P-values
+nb_glm_results <- data.frame(
+  Gene = rownames(filtered_raw_counts),
+  Log2FC = numeric(num_genes_filtered),
+  Adj_P_Value = numeric(num_genes_filtered)
+)
+
+#parameters for IRLS optimization loop
+max_iter <- 50
+tolerance <- 1e-6
+DAMPING_FACTOR <- 1e-10
+
+#NB GLM loop
+for(i in 1:num_genes_filtered) {
+  
+  Y <- filtered_raw_counts[i, ]
+  
+  #estimation of NB GLM parameter
+  mu_y <- mean(Y)
+  var_y <- var(Y)
+  alpha_approx <- (var_y - mu_y) / (mu_y^2)
+  
+  #dispersion betaween 1e-6 and 10
+  alpha_nb <- pmin(pmax(1e-6, alpha_approx), 10)
+  
+  Y_integer <- as.integer(round(Y))
+  
+  #estimation of beta via Poisson
+  beta <- tryCatch({
+    glm_fit <- glm(Y_integer ~ group_labels + offset(offset_term), family = poisson(link = "log"))
+    coef(glm_fit)
+  }, error = function(e) {
+    rep(0.1, ncol(X))
+  })
+  
+  #free memory after GML call
+  gc()
+  
+  if(length(beta) != ncol(X)) {
+    beta <- rep(0.1, ncol(X))
+  }
+  
+  converged <- FALSE
+  beta_final <- rep(NA, ncol(X))
+  X_T_W_X_final <- matrix(NA, ncol(X), ncol(X))
+  
+  tryCatch({
+    
+    #IRLS optimization
+    for(iter in 1:max_iter) {
+      
+      #linear prediction for NB distribution
+      eta <- X %*% beta + offset_term
+      mu <- exp(eta)
+      mu <- pmax(mu, DAMPING_FACTOR)
+      
+      V_mu <- mu + alpha_nb * mu^2
+      V_mu <- pmax(V_mu, DAMPING_FACTOR)
+      
+      #weight matrix W and Hessian calculation
+      dmu_deta <- mu
+      W <- diag(as.numeric(dmu_deta^2 / V_mu))
+      X_T_W_X <- t(X) %*% W %*% X
+      
+      #storing current coefficientsand hessian matrix
+      beta_final <- beta
+      X_T_W_X_final <- X_T_W_X
+      
+      #check for numerical instability
+      if(rcond(X_T_W_X) < 1e-10) {
+        break
+      }
+      
+      #update coefficient using weighted least squares solution
+      z <- eta + (Y - mu) / dmu_deta
+      beta_new <- solve(X_T_W_X) %*% t(X) %*% W %*% z
+      
+      #check for convergence based on the change in coefficients
+      if(sum(abs(beta_new - beta)) < tolerance) {
+        converged <- TRUE
+        beta_final <- beta_new
+        break
+      }
+      beta <- beta_new
+    }
+    
+    #store results if the hessian matrix is stable
+    if(!is.na(X_T_W_X_final[1,1]) && rcond(X_T_W_X_final) >= 1e-10) {
+      
+      #Log2FC is the second coefficient
+      nb_glm_results$Log2FC[i] <- beta_final[2]
+      
+      #calculate Standard error
+      Hessian_Inverse <- solve(X_T_W_X_final)
+      SE_beta <- sqrt(diag(Hessian_Inverse))
+      
+      #calculate Z-score and two-sided P-value via Normal approximation
+      Z_score <- beta_final[2] / SE_beta[2]
+      P_value <- 2 * pnorm(abs(Z_score), lower.tail = FALSE)
+      nb_glm_results$Adj_P_Value[i] <- P_value
+    } else {
+      nb_glm_results$Log2FC[i] <- 0
+      nb_glm_results$Adj_P_Value[i] <- 1
+    }
+  }, error = function(e) {
+    nb_glm_results$Log2FC[i] <- 0
+    nb_glm_results$Adj_P_Value[i] <- 1
+  })
+}
+
+#apply Benjamini Hochberg for FDR control
+nb_glm_results$Adj_P_Value <- p.adjust(nb_glm_results$Adj_P_Value, method = "BH")
+
+#negative log10 transformed P-value for the volcano plot
+nb_glm_results$neg_log10_P <- -log10(nb_glm_results$Adj_P_Value)
+
+#subset the results to identify the DEGs
+DEGs <- subset(nb_glm_results,
+               abs(Log2FC) >= log2FC_threshold &
+                 Adj_P_Value <= p_value_threshold)
+
+#get the count of significant DGEs
+num_degs <- nrow(DEGs)
+
+#start pdf for volcano plot output
+pdf("NBGLM_Volcano_plot_Precise.pdf", width = 8, height = 8)
+
+#intitial plot of all genes <- gray points
+plot(nb_glm_results$Log2FC, nb_glm_results$neg_log10_P,
+     pch = 20, cex = 0.5,
+     xlab = expression("Log"[2] * "Fold Change Krebs vs Normal)"),
+     ylab = expression("-Log"[10] * "(Adjustierter P_Wert)"),
+     main = "Volcano Plot (NB_GLM mit TMM-Offset)",
+     col = "gray40", bty = "n")
+
+#significant DEGs in red
+points(DEGs$Log2FC, -log10(DEGs$Adj_P_Value), col = "red", pch = 20, cex = 0.5)
+
+#vertical lines for Log2FC threshold
+abline(v = c(-log2FC_threshold, log2FC_threshold), col = "blue", lty = 2)
+
+#horizontal line for adjusted p-value threshold
+abline(h = -log10(p_value_threshold), col = "green3", lty = 2)
+dev.off()
+
+#heatmap generation if more than 1 DEG was found
+if(num_degs > 1){
+  #select gene names for top 50 DEGs
+  top_genes_names <- rownames(filtered_raw_counts)[match(DEGs$Gene[1:min(50, num_degs)], nb_glm_results$Gene)]
+  
+  #corresponding log-transformed counts
+  log_data_for_heatmap <- log2(filtered_raw_counts[top_genes_names, ] + 1)
+  
+  #scale data matrix row-wise
+  scaled_deg_matrix <- t(scale(t(log_data_for_heatmap)))
+  #deinfe colours
+  color_palette <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
+  #define sample group labels
+  group_names_samples <- c(rep("Krebs", length(cancer_cols_dge)), rep("Normal", length(normal_cols_dge)))
+  col_colors <- ifelse(group_names_samples == "Krebs", "red", "blue")
+  
+  #start pdf for heatmap
+  pdf("Manual_NBGLM_Heatmap.pdf")
+  #generate heatmap
+  heatmap.2(
+    scaled_deg_matrix,
+    main = paste("Top DEGs (NB-GLM, log2(Raw Counts+1))"),
+    col = color_palette,
+    density.info = "none",
+    trace = "none",
+    dendrogram = "both",
+    ColSideColors = col_colors,
+    key = TRUE,
+    keysize = 1.0,
+    labCol = colnames(filtered_raw_counts),
+    margins = c(8, 8)
+  )
+  dev.off()
+}
