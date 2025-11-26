@@ -1,0 +1,22 @@
+#load matrix
+matrix_path <- "/home/elvira/gene_level_count_matrix.tsv"
+
+raw_counts_df <- read.table(
+  matrix_path,
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  stringsAsFactors = FALSE
+)
+
+counts_matrix <- as.matrix(raw_counts_df)
+
+log_transformed_matrix <- log2(counts_matrix + 1)
+
+write.table(
+  log_transformed_matrix,
+  file = "stabilized_gene_level_count_matrix.tsv",
+  sep = "\t",
+  quote = FALSE,
+  col.names = NA
+)
